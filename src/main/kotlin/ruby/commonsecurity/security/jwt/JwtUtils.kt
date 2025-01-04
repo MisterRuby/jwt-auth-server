@@ -1,92 +1,58 @@
 package ruby.commonsecurity.security.jwt
 
 import io.jsonwebtoken.Jwts
-import io.jsonwebtoken.SignatureAlgorithm
-import io.jsonwebtoken.security.Keys
 import jakarta.annotation.PostConstruct
-import org.springframework.boot.context.properties.ConfigurationProperties
-import org.springframework.http.HttpEntity
-import org.springframework.http.HttpHeaders
-import org.springframework.http.MediaType
-import org.springframework.scheduling.annotation.Scheduled
+import jakarta.servlet.FilterChain
+import jakarta.servlet.http.HttpServletRequest
+import jakarta.servlet.http.HttpServletResponse
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken
+import org.springframework.security.core.context.SecurityContextHolder
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource
 import org.springframework.stereotype.Component
-import org.springframework.web.client.RestClientException
 import org.springframework.web.client.RestTemplate
-import java.security.KeyPair
-import java.security.PrivateKey
+import org.springframework.web.filter.OncePerRequestFilter
+import ruby.commonsecurity.security.CustomUserDetailsService
+import java.math.BigInteger
+import java.security.KeyFactory
 import java.security.PublicKey
-import java.security.interfaces.RSAPublicKey
-import java.util.*
+import java.security.spec.RSAPublicKeySpec
+import java.util.Base64.Decoder
+import java.util.Base64.getUrlDecoder
 
 @Component
 class JwtUtils(
-    private val jwtProperties: JwtProperties,
-    private val restTemplate: RestTemplate,
-) {
-    private var keyPair: KeyPair = Keys.keyPairFor(SignatureAlgorithm.RS256)
-    private var privateKey: PrivateKey = keyPair.private // 서명용
-    var publicKey: PublicKey = keyPair.public // 검증용
-
-    @PostConstruct
-    fun init() {
-        generateKeyPair()
-    }
+    private val restTemplate: RestTemplate
+){
+    private var publicKey: PublicKey? = null
 
     /**
-     * keyPair 를 일정 주기로 갱신
-     * - 갱신 후 연동되는 리소스 서버(resourceServersWebhook)에 생성된 공개키를 보내준다.
+     * 애플리케이션 실행 시 인증 서버로부터 jwk 를 요청
      */
-    @Scheduled(cron = "#{@jwtProperties.generateSchedule}")
-    fun generateKeyPair() {
-        keyPair = Keys.keyPairFor(SignatureAlgorithm.RS256)
-        privateKey = keyPair.private // 서명용
-        publicKey = keyPair.public // 검증용
-
-        jwtProperties.resourceServersUrls.forEach { url ->
-            updateResourceServerPublicKey(url)
+    @PostConstruct
+    fun getPublicKey() {
+        val jwkResponse = restTemplate.getForEntity("http://localhost:8080/jwk", Jwk::class.java)
+        if (jwkResponse.statusCode.is2xxSuccessful) {
+            val jwk = jwkResponse.body!!
+            generatePublicKey(jwk)
+        } else {
+            throw RuntimeException("Failed to fetch public key")
         }
     }
 
-    private fun updateResourceServerPublicKey(url: String): Boolean {
-        // 웹훅 요청 데이터 생성
-        return try {
-            val jwk = getJwk()
+    fun generatePublicKey(jwk: Jwk) {
+        // Base64 URL Decoder 생성
+        val decoder: Decoder = getUrlDecoder()
 
-            // 요청 헤더 설정
-            val headers = HttpHeaders()
-            headers.contentType = MediaType.APPLICATION_JSON
+        // JWK의 modulus(n)와 exponent(e)를 디코딩한 후 BigInteger로 변환
+        val modulus = BigInteger(1, decoder.decode(jwk.n)) //(Base64 디코딩된 n)
+        val exponent = BigInteger(1, decoder.decode(jwk.e)) //Base64 디코딩된 e
 
-            // HttpEntity를 사용하여 요청 body와 headers를 포함함
-            val requestEntity = HttpEntity(jwk, headers)
+        // RSA 공개키 스펙 생성
+        val publicKeySpec = RSAPublicKeySpec(modulus, exponent)
 
-            // 요청 보내기
-            restTemplate.postForEntity(url, requestEntity, String::class.java)
-            true
-        } catch (ex: RestClientException) {
-            false
-        }
-    }
-
-    fun getJwk(): Jwk {
-        val publicKey = publicKey as RSAPublicKey
-
-        // JWK 형식의 JSON 데이터 반환
-        return Jwk(
-            kty = "RSA",
-            alg = "RS256", // 알고리즘
-            use = "sig", // 용도 (서명)
-            n = Base64.getUrlEncoder().encodeToString(publicKey.modulus.toByteArray()), // modulus
-            e = Base64.getUrlEncoder().encodeToString(publicKey.publicExponent.toByteArray()) // exponent
-        )
-    }
-
-    fun generateToken(email: String): String {
-        return Jwts.builder()
-            .setSubject(email)
-            .setIssuedAt(Date())
-            .setExpiration(Date(System.currentTimeMillis() + jwtProperties.accessTokenExpirationMs))
-            .signWith(privateKey, SignatureAlgorithm.RS256)
-            .compact()
+        // KeyFactory를 통해 PublicKey 객체 생성
+        val keyFactory = KeyFactory.getInstance("RSA") // JWK의 kty에 따라 알고리즘 변경 가능
+        publicKey = keyFactory.generatePublic(publicKeySpec)
     }
 
     fun validateToken(token: String): Boolean {
@@ -105,12 +71,31 @@ class JwtUtils(
 }
 
 @Component
-@ConfigurationProperties(prefix = "jwt")
-class JwtProperties {
-    var accessTokenExpirationMs: Int = 15 * 60 * 1000 // 15분
-    var refreshTokenExpirationMs: Int = 7 * 24 * 60 * 60 * 1000 // 7일
-    var generateSchedule: String = "0 0 0 1 * *"
-    var resourceServersUrls: List<String> = emptyList()
+class JwtAuthenticationFilter(
+    private val jwtUtils: JwtUtils,
+    private val userDetailsService: CustomUserDetailsService
+) : OncePerRequestFilter() {
+
+    override fun doFilterInternal(
+        request: HttpServletRequest,
+        response: HttpServletResponse,
+        filterChain: FilterChain
+    ) {
+        val authHeader = request.getHeader("Authorization")
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            val jwt = authHeader.substring(7)
+            if (jwtUtils.validateToken(jwt)) {
+                val username = jwtUtils.getUsernameFromToken(jwt)
+                val userDetails = userDetailsService.loadUserByUsername(username)
+                val authToken = UsernamePasswordAuthenticationToken(
+                    userDetails, null, userDetails.authorities
+                )
+                authToken.details = WebAuthenticationDetailsSource().buildDetails(request)
+                SecurityContextHolder.getContext().authentication = authToken
+            }
+        }
+        filterChain.doFilter(request, response)
+    }
 }
 
 data class Jwk(val kty: String, val alg: String, val use: String, val n: String, val e: String)
